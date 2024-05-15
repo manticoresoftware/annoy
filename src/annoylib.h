@@ -901,6 +901,66 @@ struct Manhattan : Minkowski {
   }
 };
 
+class ReaderInterface
+{
+public:
+  virtual ~ReaderInterface() = default;
+  virtual void Read(uint8_t* data, size_t length) = 0;
+  virtual uint64_t Read_uint64() = 0;
+  virtual int64_t GetPos() = 0;
+  virtual int64_t GetFileSize() = 0;
+};
+
+template <typename R>
+class Reader : public ReaderInterface
+{
+public:
+  Reader(R& reader) : reader(reader) {}
+
+  void Read(uint8_t* data, size_t length) override {
+    reader.Read(data, length);
+  }
+
+  uint64_t Read_uint64() override {
+    return reader.Read_uint64();
+  }
+
+  int64_t GetPos() override {
+    return reader.GetPos();
+  }
+
+  int64_t GetFileSize() override {
+    return reader.GetFileSize();
+  }
+
+private:
+  R& reader;
+};
+
+class WriterInterface {
+public:
+  virtual ~WriterInterface() = default;
+  virtual void Write(const uint8_t* data, size_t length) = 0;
+  virtual void Write_uint64(uint64_t value) = 0;
+};
+
+template <typename W>
+class Writer : public WriterInterface {
+public:
+  Writer(W& writer) : writer(writer) {}
+
+  void Write(const uint8_t* data, size_t length) override {
+    writer.Write(data, length);
+  }
+
+  void Write_uint64(uint64_t value) override {
+    writer.Write(value);
+  }
+
+private:
+  W& writer;
+};
+
 template<typename S, typename T, typename R = uint64_t>
 class AnnoyIndexInterface {
  public:
@@ -910,8 +970,10 @@ class AnnoyIndexInterface {
   virtual bool build(int q, int n_threads=-1, char** error=NULL) = 0;
   virtual bool unbuild(char** error=NULL) = 0;
   virtual bool save(const char* filename, bool prefault=false, char** error=NULL) = 0;
+  virtual bool save_to_writer(WriterInterface& writer, char** error = NULL) = 0;
   virtual void unload() = 0;
   virtual bool load(const char* filename, bool prefault=false, char** error=NULL) = 0;
+  virtual bool load_from_reader(ReaderInterface& reader, char** error = NULL) = 0;
   virtual T get_distance(S i, S j) const = 0;
   virtual void get_nns_by_item(S item, size_t n, int search_k, vector<S>* result, vector<T>* distances) const = 0;
   virtual void get_nns_by_vector(const T* w, size_t n, int search_k, vector<S>* result, vector<T>* distances) const = 0;
@@ -1126,6 +1188,17 @@ public:
     }
   }
 
+  bool save_to_writer(WriterInterface& writer, char** error = NULL) {
+    if (!_built) {
+      set_error_from_string(error, "You can't save an index that hasn't been built");
+      return false;
+    }
+
+    writer.Write_uint64(static_cast<size_t>(_s * _n_nodes));
+    writer.Write(reinterpret_cast<uint8_t*>(_nodes), _s * _n_nodes);
+    return true;
+  }
+
   void reinitialize() {
     _fd = 0;
     _nodes = NULL;
@@ -1208,6 +1281,51 @@ public:
         _roots.push_back(i);
         m = k;
       } else {
+        break;
+      }
+    }
+    // hacky fix: since the last root precedes the copy of all roots, delete it
+    if (_roots.size() > 1 && _get(_roots.front())->children[0] == _get(_roots.back())->children[0])
+      _roots.pop_back();
+    _loaded = true;
+    _built = true;
+    _n_items = m;
+    if (_verbose) annoylib_showUpdate("found %zu roots with degree %d\n", _roots.size(), m);
+    return true;
+  }
+
+  bool load_from_reader(ReaderInterface& reader, char** error = NULL) {
+    size_t size = reader.Read_uint64();
+    if (size == 0) {
+      set_error_from_errno(error, "Size of file is zero");
+      return false;
+    } else if (reader.GetPos() + size > reader.GetFileSize()) {
+      set_error_from_errno(error, "Index size is too large. Ensure you are opening using the same metric you used to create the index.");
+      return false;
+    } else if (size % _s) {
+      // Something is fishy with this index!
+      set_error_from_errno(error, "Index size is not a multiple of vector size. Ensure you are opening using the same metric you used to create the index.");
+      return false;
+    }
+
+    _nodes = malloc(size);
+    if (_nodes == nullptr) {
+      set_error_from_errno(error, "Unable to allocate memory for index");
+      return false;
+    }
+    _n_nodes = (S)(size / _s);
+    reader.Read((uint8_t*)_nodes, size);
+
+    // Find the roots by scanning the end of the file and taking the nodes with most descendants
+    _roots.clear();
+    S m = -1;
+    for (S i = _n_nodes - 1; i >= 0; i--) {
+      S k = _get(i)->n_descendants;
+      if (m == -1 || k == m) {
+        _roots.push_back(i);
+        m = k;
+      }
+      else {
         break;
       }
     }
